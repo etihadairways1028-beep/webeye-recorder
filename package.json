@@ -1,0 +1,13 @@
+{
+  "name": "webeye-recorder",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Records IVAO pilot positions every minute for IVAO WebEye full flight tracks.",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

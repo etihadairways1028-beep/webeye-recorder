@@ -1,0 +1,13 @@
+{
+  // IVAO WebEye track recorder: saves every pilot's position once a minute so the map
+  // can show a flight's full track from pushback, for every visitor, with no API key.
+  // Runs on the Cloudflare Workers free plan (SQLite Durable Object + one cron trigger).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webeye-recorder",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "triggers": { "crons": ["* * * * *"] },
+  "durable_objects": { "bindings": [{ "name": "REC", "class_name": "Recorder" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Recorder"] }],
+  "observability": { "enabled": true }
+}
