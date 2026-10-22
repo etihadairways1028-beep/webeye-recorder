@@ -328,8 +328,9 @@ export default {
       const hit = await cache.match(key);
       if (hit) return hit;
       const pts = await recorder(env).track(Number(m[1]), since);
-      const res = json(pts, 200, { 'Cache-Control': 'public, max-age=50' });
-      ctx.waitUntil(cache.put(key, res.clone()));
+      // Only cache a real track: an empty answer must not hide history that arrives a minute later.
+      const res = json(pts, 200, { 'Cache-Control': pts.length >= 2 ? 'public, max-age=50' : 'no-store' });
+      if (pts.length >= 2) ctx.waitUntil(cache.put(key, res.clone()));
       return res;
     }
     if (url.pathname === '/' || url.pathname === '/status') {
