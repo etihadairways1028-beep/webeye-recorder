@@ -9,7 +9,11 @@
 // one-time code in their ATIS (read back from the public feed), then sends squawks and taxi
 // routes that the pilot's WebEye picks up. See "ATC clearances" below.
 //
-// Free-plan budget (per day): ~23k rows inserted + ~23k deleted (limit 100k written),
+// It also keeps an automatic logbook (takeoff → landing per pilot), touchdowns sent by the
+// WebEye Link sim add-on, and weekly leaderboards (hours, flights, landings, ATC time).
+//
+// Free-plan budget (per day): ~23k rows inserted + ~23k deleted, ~15k ATC-time updates and
+// a few rows per landing (limit 100k written),
 // track reads use the (shard, minute) key so a long-haul track costs ≤ 1,080 rows read.
 import { DurableObject } from 'cloudflare:workers';
 
