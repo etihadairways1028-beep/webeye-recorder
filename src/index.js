@@ -42,7 +42,13 @@ export class Recorder extends DurableObject {
     // Logbook: flights in progress (since takeoff) and completed flights by VID.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS active (session INTEGER PRIMARY KEY, vid INTEGER, data TEXT, takeoff INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS logbook (vid INTEGER NOT NULL, landed INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (vid, landed)) WITHOUT ROWID`);
+    // Touchdowns sent by the WebEye Link sim add-on, and weekly totals for the leaderboards.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS touchdown (session INTEGER NOT NULL, at INTEGER NOT NULL, vid INTEGER, data TEXT, PRIMARY KEY (session, at)) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS weekly (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, flights INTEGER, best_fpm INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_week (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
     this.prev = null; // session -> onGround at the previous minute
+    this.tdLog = new Map();
+    this.lbCache = null;
     this.feed = null;
     this.feedAt = 0;
     this.sendLog = new Map();
@@ -104,6 +110,15 @@ export class Recorder extends DurableObject {
       this.setMeta({ hist: JSON.stringify(hist) });
     }
 
+    // ATC time for the leaderboards: every controller online gets 15 minutes, every 15 minutes.
+    if (minute % 15 === 0) {
+      const week = weekOf(minute * 60000);
+      for (const a of this.atcList(this.feed)) {
+        if (!POSITIONS.has(a.position) || !a.vid) continue;
+        this.sql.exec('INSERT INTO atc_week (week, vid, minutes, callsign) VALUES (?, ?, 15, ?) ON CONFLICT (week, vid) DO UPDATE SET minutes = minutes + 15, callsign = excluded.callsign', week, a.vid, a.callsign);
+      }
+    }
+
     // Prune once every 10 minutes, shard by shard along the key (cheap on rows read).
     if (minute % 10 === 0) {
       const cutoff = minute - KEEP_MIN;
@@ -113,6 +128,11 @@ export class Recorder extends DurableObject {
       this.sql.exec('DELETE FROM atc_session WHERE created < ?', now - 24 * 3600e3);
       this.sql.exec('DELETE FROM clearance WHERE at < ?', now - 6 * 3600e3);
       this.sql.exec('DELETE FROM active WHERE takeoff < ?', now - 24 * 3600e3);
+      if (minute % 1440 === 0) {
+        this.sql.exec('DELETE FROM touchdown WHERE at < ?', now - 48 * 3600e3);
+        this.sql.exec('DELETE FROM weekly WHERE week < ?', weekOf(now) - 12);
+        this.sql.exec('DELETE FROM atc_week WHERE week < ?', weekOf(now) - 12);
+      }
     }
     this.setMeta({ lastMinute: String(minute), pilots: String(n) });
     return { ok: true, pilots: n };
@@ -155,7 +175,15 @@ export class Recorder extends DurableObject {
           this.sql.exec('DELETE FROM active WHERE session = ?', p.id);
           const info = JSON.parse(a.data);
           const flight = now - a.takeoff >= 3 * 60000 ? this.summarise(p, info, a.takeoff, now) : null; // ignore bounces
-          if (flight) this.sql.exec('INSERT OR REPLACE INTO logbook (vid, landed, data) VALUES (?, ?, ?)', a.vid, now, JSON.stringify(flight));
+          if (flight) {
+            this.sql.exec('INSERT OR REPLACE INTO logbook (vid, landed, data) VALUES (?, ?, ?)', a.vid, now, JSON.stringify(flight));
+            const best = flight.touchdown ? Math.abs(flight.touchdown.fpm) : null;
+            this.sql.exec(
+              'INSERT INTO weekly (week, vid, minutes, flights, best_fpm, callsign) VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT (week, vid) DO UPDATE SET minutes = minutes + excluded.minutes, flights = flights + 1, callsign = excluded.callsign, best_fpm = CASE WHEN excluded.best_fpm IS NULL THEN best_fpm WHEN best_fpm IS NULL THEN excluded.best_fpm ELSE MIN(best_fpm, excluded.best_fpm) END',
+              weekOf(now), a.vid, flight.airborneMin, best, flight.callsign,
+            );
+            this.lbCache = null;
+          }
         }
       }
     }
@@ -183,13 +211,67 @@ export class Recorder extends DurableObject {
     const step = Math.max(1, Math.ceil(pts.length / 90));
     const route = pts.filter((_, i) => i % step === 0 || i === pts.length - 1).map((q) => [Math.round(q.longitude * 1e4) / 1e4, Math.round(q.latitude * 1e4) / 1e4, Math.round((q.altitude || 0) / 100)]);
     const t = p.lastTrack || {};
-    return { ...info, takeoff, landed, airborneMin: Math.round((landed - takeoff) / 60e3), distanceNm: Math.round(dist), maxAlt, descentFpm: descent, landedLat: t.latitude, landedLon: t.longitude, route };
+    // The add-on's touchdown for this flight (the last one, so touch-and-goes don't count).
+    const td = this.sql.exec('SELECT data FROM touchdown WHERE session = ? AND at >= ? AND at <= ? ORDER BY at DESC LIMIT 1', p.id, takeoff, landed + 3 * 60e3).toArray()[0];
+    const touchdown = td ? JSON.parse(td.data) : null;
+    return { ...info, takeoff, landed, touchdown, airborneMin: Math.round((landed - takeoff) / 60e3), distanceNm: Math.round(dist), maxAlt, descentFpm: descent, landedLat: t.latitude, landedLon: t.longitude, route };
   }
 
   logbookFor(vid) {
     const rows = this.sql.exec('SELECT landed, data FROM logbook WHERE vid = ? ORDER BY landed DESC LIMIT 300', vid).toArray();
     const active = this.sql.exec('SELECT session, data, takeoff FROM active WHERE vid = ?', vid).toArray().map((r) => ({ session: r.session, takeoff: r.takeoff, ...JSON.parse(r.data) }));
-    return { flights: rows.map((r) => JSON.parse(r.data)), active };
+    const atc = this.sql.exec('SELECT SUM(minutes) AS m FROM atc_week WHERE vid = ?', vid).toArray()[0];
+    return { flights: rows.map((r) => JSON.parse(r.data)), active, atcMinutes: (atc && atc.m) || 0 };
+  }
+
+  /** Touchdown from the WebEye Link add-on. Accepted only if that VID is flying on IVAO right there. */
+  async touchdown(body) {
+    const vid = Number(body.vid);
+    if (!Number.isInteger(vid) || vid <= 0) return { status: 400, body: { error: 'Missing VID.' } };
+    const now = Date.now();
+    if (now - (this.tdLog.get(vid) || 0) < 20e3) return { status: 429, body: { error: 'Too many touchdowns.' } };
+    const num = (v, lo, hi) => (typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi ? v : null);
+    const lat = num(body.lat, -90, 90), lon = num(body.lon, -180, 180), fpm = num(body.fpm, -5000, 500);
+    if (lat == null || lon == null || fpm == null) return { status: 400, body: { error: 'Bad touchdown.' } };
+    const feed = await this.getFeed();
+    const p = ((feed.clients && feed.clients.pilots) || []).find((x) => x.userId === vid);
+    if (!p || !p.lastTrack) return { status: 404, body: { error: `VID ${vid} isn't flying on IVAO right now.` } };
+    const R = Math.PI / 180, t = p.lastTrack;
+    const d = 3440 * 2 * Math.asin(Math.sqrt(Math.sin(((t.latitude - lat) * R) / 2) ** 2 + Math.cos(lat * R) * Math.cos(t.latitude * R) * Math.sin(((t.longitude - lon) * R) / 2) ** 2));
+    if (d > 20) return { status: 409, body: { error: 'Your sim position does not match your IVAO position.' } };
+    const data = {
+      fpm: Math.round(fpm),
+      g: num(body.g, 0, 6) != null ? Math.round(body.g * 100) / 100 : null,
+      ias: num(body.ias, 0, 400) != null ? Math.round(body.ias) : null,
+      pitch: num(body.pitch, -30, 30) != null ? Math.round(body.pitch * 10) / 10 : null,
+      bank: num(body.bank, -60, 60) != null ? Math.round(body.bank * 10) / 10 : null,
+      fuelUsedKg: num(body.fuelUsedKg, 0, 300000) != null ? Math.round(body.fuelUsedKg) : null,
+      bounces: num(body.bounces, 0, 20) != null ? Math.round(body.bounces) : 0,
+      sim: clean(body.sim, 24),
+      // Local testing runs on fake minutes; keep the touchdown on the same clock.
+      at: this.env && this.env.TEST_FAKE_MINUTES ? Number(this.getMeta('lastMinute')) * 60000 + 30e3 : now,
+    };
+    this.sql.exec('INSERT OR REPLACE INTO touchdown (session, at, vid, data) VALUES (?, ?, ?, ?)', p.id, data.at, vid, JSON.stringify(data));
+    this.tdLog.set(vid, now);
+    return { status: 200, body: { ok: true, callsign: p.callsign, ...data } };
+  }
+
+  /** This week's (or last week's) top pilots and controllers. */
+  leaderboard(which) {
+    const week = weekOf(Date.now()) - (which === 'last' ? 1 : 0);
+    const key = `${week}`;
+    if (this.lbCache && this.lbCache.key === key && Date.now() - this.lbCache.at < 300e3) return this.lbCache.body;
+    const rows = (q) => this.sql.exec(q, week).toArray();
+    const body = {
+      week,
+      from: new Date(week * 7 * 864e5 - 3 * 864e5).toISOString(),
+      hours: rows('SELECT vid, callsign, minutes, flights FROM weekly WHERE week = ? ORDER BY minutes DESC LIMIT 10'),
+      flights: rows('SELECT vid, callsign, minutes, flights FROM weekly WHERE week = ? ORDER BY flights DESC, minutes DESC LIMIT 10'),
+      landings: rows('SELECT vid, callsign, best_fpm AS fpm FROM weekly WHERE week = ? AND best_fpm IS NOT NULL ORDER BY best_fpm ASC LIMIT 10'),
+      atc: rows('SELECT vid, callsign, minutes FROM atc_week WHERE week = ? ORDER BY minutes DESC LIMIT 10'),
+    };
+    this.lbCache = { key, at: Date.now(), body };
+    return body;
   }
 
   stats() {
@@ -384,6 +466,10 @@ Object.assign(Recorder.prototype, {
 });
 
 const recorder = (env) => env.REC.get(env.REC.idFromName('main'));
+/** Weeks since the epoch, starting on Mondays (UTC). */
+function weekOf(ms) {
+  return Math.floor((Math.floor(ms / 864e5) + 3) / 7);
+}
 
 export default {
   async scheduled(_event, env, ctx) {
@@ -407,6 +493,7 @@ export default {
       if (request.method === 'POST' && url.pathname === '/atc/verify') return reply(await rec.atcVerify(await body()));
       if (request.method === 'POST' && url.pathname === '/atc/me') return reply(await rec.atcMe((await body()).token));
       if (request.method === 'POST' && url.pathname === '/atc/send') return reply(await rec.atcSend(await body()));
+      if (request.method === 'POST' && url.pathname === '/touchdown') return reply(await rec.touchdown(await body()));
       const c = /^\/clearance\/([A-Za-z0-9_-]{2,12})(\/ack)?\/?$/.exec(url.pathname);
       if (c && request.method === 'GET' && !c[2]) return reply(await rec.clearanceFor(c[1], Number(url.searchParams.get('session')) || 0));
       if (c && request.method === 'POST' && c[2]) return reply(await rec.clearanceAck(c[1], await body()));
@@ -431,6 +518,7 @@ export default {
     }
     const lb = /^\/logbook\/(\d{3,8})\/?$/.exec(url.pathname);
     if (lb) return json(await rec.logbookFor(Number(lb[1])), 200, { 'Cache-Control': 'no-store' });
+    if (url.pathname === '/leaderboard') return json(await rec.leaderboard(url.searchParams.get('week')), 200, { 'Cache-Control': 'public, max-age=120' });
     if (url.pathname === '/stats') return json(await rec.stats(), 200, { 'Cache-Control': 'public, max-age=120' });
     if (url.pathname === '/' || url.pathname === '/status') {
       return json({ service: 'IVAO WebEye track recorder', ...(await recorder(env).status()) });
