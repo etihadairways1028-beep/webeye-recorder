@@ -39,6 +39,10 @@ export class Recorder extends DurableObject {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_pending (callsign TEXT PRIMARY KEY, vid INTEGER, code TEXT, expires INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_session (token TEXT PRIMARY KEY, callsign TEXT, vid INTEGER, atc_id INTEGER, position TEXT, created INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS clearance (pilot TEXT PRIMARY KEY, session INTEGER, data TEXT, at INTEGER, ack INTEGER, from_cs TEXT) WITHOUT ROWID`);
+    // Logbook: flights in progress (since takeoff) and completed flights by VID.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS active (session INTEGER PRIMARY KEY, vid INTEGER, data TEXT, takeoff INTEGER) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS logbook (vid INTEGER NOT NULL, landed INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (vid, landed)) WITHOUT ROWID`);
+    this.prev = null; // session -> onGround at the previous minute
     this.feed = null;
     this.feedAt = 0;
     this.sendLog = new Map();
@@ -87,6 +91,19 @@ export class Recorder extends DurableObject {
       n += list.length;
     }
 
+    // Logbook: compare each pilot's on-ground flag with the previous minute.
+    try {
+      this.detectFlights(pilots, minute);
+    } catch (e) {
+      this.setMeta({ logbookError: String(e && e.message ? e.message : e) });
+    }
+    // Network history for the stats charts: pilots and ATC online, every 10 minutes for 18 h.
+    if (minute % 10 === 0) {
+      const hist = JSON.parse(this.getMeta('hist') || '[]').filter((h) => h[0] > minute - KEEP_MIN);
+      hist.push([minute, n, ((this.feed && this.feed.clients && this.feed.clients.atcs) || []).length]);
+      this.setMeta({ hist: JSON.stringify(hist) });
+    }
+
     // Prune once every 10 minutes, shard by shard along the key (cheap on rows read).
     if (minute % 10 === 0) {
       const cutoff = minute - KEEP_MIN;
@@ -95,9 +112,88 @@ export class Recorder extends DurableObject {
       this.sql.exec('DELETE FROM atc_pending WHERE expires < ?', now);
       this.sql.exec('DELETE FROM atc_session WHERE created < ?', now - 24 * 3600e3);
       this.sql.exec('DELETE FROM clearance WHERE at < ?', now - 6 * 3600e3);
+      this.sql.exec('DELETE FROM active WHERE takeoff < ?', now - 24 * 3600e3);
     }
     this.setMeta({ lastMinute: String(minute), pilots: String(n) });
     return { ok: true, pilots: n };
+  }
+
+  getMeta(k) {
+    const r = this.sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0];
+    return r ? r.v : null;
+  }
+
+  /** Takeoff = on ground last minute, airborne now; landing = the reverse. Rows are written only on those changes. */
+  detectFlights(pilots, minute) {
+    const now = minute * 60000;
+    const cur = new Map();
+    for (const p of pilots) {
+      const t = p && p.lastTrack;
+      if (!t || typeof p.id !== 'number') continue;
+      cur.set(p.id, !!t.onGround);
+    }
+    if (!this.prev) {
+      // First run after a restart: rebuild the previous minute from the last snapshot.
+      this.prev = new Map();
+      const rows = [];
+      for (let sh = 0; sh < SHARDS; sh++) rows.push(...this.sql.exec('SELECT data FROM snap WHERE shard = ? AND minute = ?', sh, minute - 1).toArray());
+      for (const r of rows) {
+        const dv = new DataView(r.data instanceof ArrayBuffer ? r.data : new Uint8Array(r.data).buffer);
+        for (let i = 0; i + REC <= dv.byteLength; i += REC) this.prev.set(dv.getUint32(i), dv.getUint8(i + 16) === 1);
+      }
+    }
+    for (const p of pilots) {
+      if (!cur.has(p.id) || !this.prev.has(p.id)) continue;
+      const was = this.prev.get(p.id), is = cur.get(p.id);
+      const fp = p.flightPlan || {};
+      if (was && !is) {
+        const info = { callsign: p.callsign, dep: fp.departureId || null, arr: fp.arrivalId || null, aircraft: (fp.aircraft && fp.aircraft.icaoCode) || fp.aircraftId || null, online: p.createdAt || null };
+        this.sql.exec('INSERT OR REPLACE INTO active (session, vid, data, takeoff) VALUES (?, ?, ?, ?)', p.id, p.userId, JSON.stringify(info), now);
+      } else if (!was && is) {
+        const a = this.sql.exec('SELECT vid, data, takeoff FROM active WHERE session = ?', p.id).toArray()[0];
+        if (a) {
+          this.sql.exec('DELETE FROM active WHERE session = ?', p.id);
+          const info = JSON.parse(a.data);
+          const flight = now - a.takeoff >= 3 * 60000 ? this.summarise(p, info, a.takeoff, now) : null; // ignore bounces
+          if (flight) this.sql.exec('INSERT OR REPLACE INTO logbook (vid, landed, data) VALUES (?, ?, ?)', a.vid, now, JSON.stringify(flight));
+        }
+      }
+    }
+    this.prev = cur;
+  }
+
+  summarise(p, info, takeoff, landed) {
+    const pts = this.track(p.id, takeoff - 120e3).filter((q) => new Date(q.timestamp).getTime() <= landed + 60e3);
+    let dist = 0, maxAlt = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const R = Math.PI / 180;
+      const d = 2 * Math.asin(Math.sqrt(Math.sin(((b.latitude - a.latitude) * R) / 2) ** 2 + Math.cos(a.latitude * R) * Math.cos(b.latitude * R) * Math.sin(((b.longitude - a.longitude) * R) / 2) ** 2));
+      dist += d * 3440.065;
+    }
+    for (const q of pts) maxAlt = Math.max(maxAlt, q.altitude || 0);
+    // Final descent: the last two airborne reports before touchdown (one a minute) — an estimate.
+    const air = pts.filter((q) => !q.onGround);
+    let descent = null;
+    if (air.length >= 2) {
+      const x = air[air.length - 2], y = air[air.length - 1];
+      const mins = (new Date(y.timestamp) - new Date(x.timestamp)) / 60e3;
+      if (mins > 0 && mins <= 3) descent = Math.round((y.altitude - x.altitude) / mins);
+    }
+    const step = Math.max(1, Math.ceil(pts.length / 90));
+    const route = pts.filter((_, i) => i % step === 0 || i === pts.length - 1).map((q) => [Math.round(q.longitude * 1e4) / 1e4, Math.round(q.latitude * 1e4) / 1e4, Math.round((q.altitude || 0) / 100)]);
+    const t = p.lastTrack || {};
+    return { ...info, takeoff, landed, airborneMin: Math.round((landed - takeoff) / 60e3), distanceNm: Math.round(dist), maxAlt, descentFpm: descent, landedLat: t.latitude, landedLon: t.longitude, route };
+  }
+
+  logbookFor(vid) {
+    const rows = this.sql.exec('SELECT landed, data FROM logbook WHERE vid = ? ORDER BY landed DESC LIMIT 300', vid).toArray();
+    const active = this.sql.exec('SELECT session, data, takeoff FROM active WHERE vid = ?', vid).toArray().map((r) => ({ session: r.session, takeoff: r.takeoff, ...JSON.parse(r.data) }));
+    return { flights: rows.map((r) => JSON.parse(r.data)), active };
+  }
+
+  stats() {
+    return { hist: JSON.parse(this.getMeta('hist') || '[]').map(([m, p, a]) => ({ t: new Date(m * 60000).toISOString(), pilots: p, atc: a })) };
   }
 
   setMeta(obj) {
@@ -333,6 +429,9 @@ export default {
       if (pts.length >= 2) ctx.waitUntil(cache.put(key, res.clone()));
       return res;
     }
+    const lb = /^\/logbook\/(\d{3,8})\/?$/.exec(url.pathname);
+    if (lb) return json(await rec.logbookFor(Number(lb[1])), 200, { 'Cache-Control': 'no-store' });
+    if (url.pathname === '/stats') return json(await rec.stats(), 200, { 'Cache-Control': 'public, max-age=120' });
     if (url.pathname === '/' || url.pathname === '/status') {
       return json({ service: 'IVAO WebEye track recorder', ...(await recorder(env).status()) });
     }
