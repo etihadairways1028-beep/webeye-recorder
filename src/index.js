@@ -50,6 +50,10 @@ export class Recorder extends DurableObject {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS touchdown (session INTEGER NOT NULL, at INTEGER NOT NULL, vid INTEGER, data TEXT, PRIMARY KEY (session, at)) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS weekly (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, flights INTEGER, best_fpm INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_week (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
+    // Replay: who each session is (written once per new session) and ATC online every 5 minutes.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS sess (session INTEGER PRIMARY KEY, vid INTEGER, callsign TEXT, type TEXT, dep TEXT, arr TEXT, seen INTEGER) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_snap (minute INTEGER PRIMARY KEY, data TEXT) WITHOUT ROWID`);
+    this.known = null; // sessions already in sess
     this.prev = null; // session -> onGround at the previous minute
     this.tdLog = new Map();
     this.lbCache = null;
@@ -101,6 +105,27 @@ export class Recorder extends DurableObject {
       n += list.length;
     }
 
+    // Replay: remember who new sessions are (one row per new session, not per minute).
+    try {
+      if (!this.known) this.known = new Set(this.sql.exec('SELECT session FROM sess WHERE seen > ?', (minute - KEEP_MIN - 120) * 60000).toArray().map((r) => r.session));
+      for (const p of pilots) {
+        if (typeof p.id !== 'number' || this.known.has(p.id)) continue;
+        const fp = p.flightPlan || {};
+        this.sql.exec('INSERT OR IGNORE INTO sess (session, vid, callsign, type, dep, arr, seen) VALUES (?, ?, ?, ?, ?, ?, ?)', p.id, p.userId || 0, String(p.callsign || '').slice(0, 12), (fp.aircraft && fp.aircraft.icaoCode) || fp.aircraftId || null, fp.departureId || null, fp.arrivalId || null, minute * 60000);
+        this.known.add(p.id);
+      }
+      if (minute % 5 === 0) {
+        const atc = this.atcList(this.feed).filter((a) => a.position !== 'ATIS' && a.position !== 'OBS').map((a) => {
+          const raw = ((this.feed.clients && this.feed.clients.atcs) || []).find((x) => x.id === a.id) || {};
+          const t = raw.lastTrack || {};
+          return [a.callsign, a.position, a.frequency || null, typeof t.latitude === 'number' ? Math.round(t.latitude * 1e3) / 1e3 : null, typeof t.longitude === 'number' ? Math.round(t.longitude * 1e3) / 1e3 : null];
+        });
+        this.sql.exec('INSERT OR REPLACE INTO atc_snap (minute, data) VALUES (?, ?)', minute, JSON.stringify(atc));
+      }
+    } catch (e) {
+      this.setMeta({ replayError: String(e && e.message ? e.message : e) });
+    }
+
     // Logbook: compare each pilot's on-ground flag with the previous minute.
     try {
       this.detectFlights(pilots, minute);
@@ -132,6 +157,11 @@ export class Recorder extends DurableObject {
       this.sql.exec('DELETE FROM atc_session WHERE created < ?', now - 24 * 3600e3);
       this.sql.exec('DELETE FROM clearance WHERE at < ?', now - 6 * 3600e3);
       this.sql.exec('DELETE FROM active WHERE takeoff < ?', now - 24 * 3600e3);
+      this.sql.exec('DELETE FROM atc_snap WHERE minute < ?', cutoff);
+      if (minute % 120 === 0) {
+        this.sql.exec('DELETE FROM sess WHERE seen < ?', (minute - KEEP_MIN - 24 * 60) * 60000);
+        this.known = null;
+      }
       if (minute % 1440 === 0) {
         this.sql.exec('DELETE FROM touchdown WHERE at < ?', now - 48 * 3600e3);
         this.sql.exec('DELETE FROM weekly WHERE week < ?', weekOf(now) - 12);
@@ -258,6 +288,42 @@ export class Recorder extends DurableObject {
     this.sql.exec('INSERT OR REPLACE INTO touchdown (session, at, vid, data) VALUES (?, ?, ?, ?)', p.id, data.at, vid, JSON.stringify(data));
     this.tdLog.set(vid, now);
     return { status: 200, body: { ok: true, callsign: p.callsign, ...data } };
+  }
+
+  /**
+   * Replay frames: every pilot's position for `n` minutes from `from`, as base64 of the packed
+   * 17-byte records, plus who each session is and the ATC online at the start.
+   */
+  replay(from, n) {
+    const out = { minutes: [], frames: [], info: {}, atc: [] };
+    const ids = new Set();
+    for (let m = from; m < from + n; m++) {
+      const parts = [];
+      for (let sh = 0; sh < SHARDS; sh++) parts.push(...this.sql.exec('SELECT data FROM snap WHERE shard = ? AND minute = ?', sh, m).toArray()); // 16 key lookups
+      if (!parts.length) continue;
+      const bufs = parts.map((r) => new Uint8Array(r.data instanceof ArrayBuffer ? r.data : r.data.buffer || r.data));
+      const len = bufs.reduce((a, b) => a + b.length, 0);
+      const all = new Uint8Array(len);
+      let o = 0;
+      for (const b of bufs) all.set(b, o), (o += b.length);
+      const dv = new DataView(all.buffer);
+      for (let i = 0; i + REC <= len; i += REC) ids.add(dv.getUint32(i));
+      out.minutes.push(m);
+      out.frames.push(b64(all));
+    }
+    if (ids.size) {
+      const list = [...ids];
+      for (let i = 0; i < list.length; i += 400) {
+        const chunk = list.slice(i, i + 400);
+        for (const r of this.sql.exec(`SELECT session, vid, callsign, type, dep, arr FROM sess WHERE session IN (${chunk.map(() => '?').join(',')})`, ...chunk).toArray()) out.info[r.session] = [r.callsign, r.vid, r.type, r.dep, r.arr];
+      }
+    }
+    const a = this.sql.exec('SELECT minute, data FROM atc_snap WHERE minute <= ? ORDER BY minute DESC LIMIT 1', from + Math.floor(n / 2)).toArray()[0];
+    if (a) out.atc = JSON.parse(a.data);
+    const first = this.sql.exec('SELECT minute FROM snap WHERE shard = 0 ORDER BY minute LIMIT 1').toArray()[0];
+    out.oldest = first ? first.minute : null;
+    out.latest = Number(this.getMeta('lastMinute')) || null;
+    return out;
   }
 
   /** This week's (or last week's) top pilots and controllers. */
@@ -470,6 +536,12 @@ Object.assign(Recorder.prototype, {
 });
 
 const recorder = (env) => env.REC.get(env.REC.idFromName('main'));
+function b64(u8) {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
 /** Weeks since the epoch, starting on Mondays (UTC). */
 function weekOf(ms) {
   return Math.floor((Math.floor(ms / 864e5) + 3) / 7);
@@ -522,6 +594,21 @@ export default {
     }
     const lb = /^\/logbook\/(\d{3,8})\/?$/.exec(url.pathname);
     if (lb) return json(await rec.logbookFor(Number(lb[1])), 200, { 'Cache-Control': 'no-store' });
+    if (url.pathname === '/replay') {
+      const now = Math.floor(Date.now() / 60000);
+      const from = Math.floor(Number(url.searchParams.get('from')) || now - 30);
+      const n = Math.max(1, Math.min(15, Math.floor(Number(url.searchParams.get('n')) || 10)));
+      if (from < now - KEEP_MIN - 5 || from > now) return json({ error: 'Out of range' }, 400);
+      const cache = caches.default;
+      const key = new Request(`${url.origin}/replay?from=${from}&n=${n}`);
+      const hit = await cache.match(key);
+      if (hit) return hit;
+      const body = await rec.replay(from, n);
+      const complete = from + n <= (body.latest || 0);
+      const res = json(body, 200, { 'Cache-Control': complete ? 'public, max-age=3600' : 'no-store' });
+      if (complete) ctx.waitUntil(cache.put(key, res.clone()));
+      return res;
+    }
     if (url.pathname === '/leaderboard') return json(await rec.leaderboard(url.searchParams.get('week')), 200, { 'Cache-Control': 'public, max-age=120' });
     if (url.pathname === '/stats') return json(await rec.stats(), 200, { 'Cache-Control': 'public, max-age=120' });
     if (url.pathname === '/' || url.pathname === '/status') {
