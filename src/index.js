@@ -396,7 +396,7 @@ const clean = (s, max) => String(s ?? '').replace(/[^\x20-\x7E]/g, '').trim().sl
 const randomCode = () => {
   const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const b = crypto.getRandomValues(new Uint8Array(4));
-  return 'WE-' + Array.from(b, (x) => a[x % a.length]).join('');
+  return 'PU-' + Array.from(b, (x) => a[x % a.length]).join('');
 };
 const randomToken = () => Array.from(crypto.getRandomValues(new Uint8Array(24)), (x) => x.toString(16).padStart(2, '0')).join('');
 
