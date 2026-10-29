@@ -12,14 +12,17 @@
 // It also keeps an automatic logbook (takeoff → landing per pilot), touchdowns sent by the
 // Pulse Link sim add-on, and weekly leaderboards (hours, flights, landings, ATC time).
 //
-// Free-plan budget (per day): ~23k rows inserted + ~23k deleted, ~15k ATC-time updates and
-// a few rows per landing (limit 100k written),
-// track reads use the (shard, minute) key so a long-haul track costs ≤ 1,080 rows read.
+// Free-plan budget (limits: 100k rows written, 5M rows read per day):
+//  • positions go into a fixed ring of 16 rows × 1,080 minutes, overwritten in place (≈23k writes/day,
+//    no deletes); new sessions ≈5k; two rows per landing; ATC every 5 minutes. ≈35k writes/day.
+//  • the ring is kept in memory once read, so track and replay lookups normally cost no reads.
 import { DurableObject } from 'cloudflare:workers';
 
 const WHAZZUP = 'https://api.ivao.aero/v2/tracker/whazzup';
 const SHARDS = 16; // pilots are spread over 16 rows per minute
 const KEEP_MIN = 18 * 60; // keep 18 hours: enough for the longest flights
+const SLOTS = KEEP_MIN + 10; // ring slots per shard (minute % SLOTS)
+const ATC_KEEP_MIN = 8 * 1440; // ATC snapshots kept 8 days (weekly ATC leaderboard)
 const REC = 17; // bytes per pilot: u32 session, f32 lat, f32 lon, u16 alt/2, u16 gs, u8 flags
 
 const CORS = {
@@ -37,23 +40,26 @@ export class Recorder extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS snap (shard INTEGER NOT NULL, minute INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (shard, minute)) WITHOUT ROWID`);
+    // Positions: a ring per shard, slot = minute % SLOTS, overwritten in place (no deletes).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS ring (shard INTEGER NOT NULL, slot INTEGER NOT NULL, minute INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (shard, slot)) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID`);
     // ATC: pending verifications, verified sessions, and the latest clearance per pilot.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_pending (callsign TEXT PRIMARY KEY, vid INTEGER, code TEXT, expires INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_session (token TEXT PRIMARY KEY, callsign TEXT, vid INTEGER, atc_id INTEGER, position TEXT, created INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS clearance (pilot TEXT PRIMARY KEY, session INTEGER, data TEXT, at INTEGER, ack INTEGER, from_cs TEXT) WITHOUT ROWID`);
-    // Logbook: flights in progress (since takeoff) and completed flights by VID.
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS active (session INTEGER PRIMARY KEY, vid INTEGER, data TEXT, takeoff INTEGER) WITHOUT ROWID`);
+    // Logbook: completed flights by VID.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS logbook (vid INTEGER NOT NULL, landed INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (vid, landed)) WITHOUT ROWID`);
     // Touchdowns sent by the Pulse Link sim add-on, and weekly totals for the leaderboards.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS touchdown (session INTEGER NOT NULL, at INTEGER NOT NULL, vid INTEGER, data TEXT, PRIMARY KEY (session, at)) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS weekly (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, flights INTEGER, best_fpm INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_week (week INTEGER NOT NULL, vid INTEGER NOT NULL, minutes INTEGER, callsign TEXT, PRIMARY KEY (week, vid)) WITHOUT ROWID`);
     // Replay: who each session is (written once per new session) and ATC online every 5 minutes.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sess (session INTEGER PRIMARY KEY, vid INTEGER, callsign TEXT, type TEXT, dep TEXT, arr TEXT, seen INTEGER) WITHOUT ROWID`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS atc_snap (minute INTEGER PRIMARY KEY, data TEXT) WITHOUT ROWID`);
     this.known = null; // sessions already in sess
+    this.mem = new Map(); // shard -> Map<minute, Uint8Array>, filled on first use
+    this.last = null; // { minute, pilots } of the latest recording
+    this.takeoffs = new Map(); // session -> takeoff minute (in memory; recovered from the track if lost)
+    this.atcAgg = null; // cached ATC minutes per VID
     this.prev = null; // session -> onGround at the previous minute
     this.tdLog = new Map();
     this.lbCache = null;
@@ -65,7 +71,7 @@ export class Recorder extends DurableObject {
   /** Called by the cron trigger once a minute. */
   async record() {
     // TEST_FAKE_MINUTES (local testing only): each run counts as the next minute.
-    const minute = this.env && this.env.TEST_FAKE_MINUTES ? Math.floor(Date.now() / 60000) - 60 + (this.fake = (this.fake || 0) + 1) : Math.floor(Date.now() / 60000);
+    const minute = this.env && this.env.TEST_FAKE_MINUTES ? (this.latestMinute() || Math.floor(Date.now() / 60000) - 60) + 1 : Math.floor(Date.now() / 60000);
     let pilots;
     try {
       const res = await fetch((this.env && this.env.WHAZZUP_URL) || WHAZZUP, { headers: { Accept: 'application/json', 'User-Agent': 'IVAO-Pulse-recorder/1.0 (+community)' } });
@@ -101,7 +107,7 @@ export class Recorder extends DurableObject {
         dv.setUint16(o + 14, Math.max(0, Math.min(65535, Math.round(Number(t.groundSpeed) || 0))));
         dv.setUint8(o + 16, t.onGround ? 1 : 0);
       });
-      this.sql.exec('INSERT OR REPLACE INTO snap (shard, minute, data) VALUES (?, ?, ?)', s, minute, buf);
+      this.writeShard(s, minute, buf);
       n += list.length;
     }
 
@@ -118,7 +124,7 @@ export class Recorder extends DurableObject {
         const atc = this.atcList(this.feed).filter((a) => a.position !== 'ATIS' && a.position !== 'OBS').map((a) => {
           const raw = ((this.feed.clients && this.feed.clients.atcs) || []).find((x) => x.id === a.id) || {};
           const t = raw.lastTrack || {};
-          return [a.callsign, a.position, a.frequency || null, typeof t.latitude === 'number' ? Math.round(t.latitude * 1e3) / 1e3 : null, typeof t.longitude === 'number' ? Math.round(t.longitude * 1e3) / 1e3 : null];
+          return [a.callsign, a.position, a.frequency || null, typeof t.latitude === 'number' ? Math.round(t.latitude * 1e3) / 1e3 : null, typeof t.longitude === 'number' ? Math.round(t.longitude * 1e3) / 1e3 : null, a.vid || 0];
         });
         this.sql.exec('INSERT OR REPLACE INTO atc_snap (minute, data) VALUES (?, ?)', minute, JSON.stringify(atc));
       }
@@ -139,25 +145,14 @@ export class Recorder extends DurableObject {
       this.setMeta({ hist: JSON.stringify(hist) });
     }
 
-    // ATC time for the leaderboards: every controller online gets 15 minutes, every 15 minutes.
-    if (minute % 15 === 0) {
-      const week = weekOf(minute * 60000);
-      for (const a of this.atcList(this.feed)) {
-        if (!POSITIONS.has(a.position) || !a.vid) continue;
-        this.sql.exec('INSERT INTO atc_week (week, vid, minutes, callsign) VALUES (?, ?, 15, ?) ON CONFLICT (week, vid) DO UPDATE SET minutes = minutes + 15, callsign = excluded.callsign', week, a.vid, a.callsign);
-      }
-    }
-
     // Prune once every 10 minutes, shard by shard along the key (cheap on rows read).
     if (minute % 10 === 0) {
       const cutoff = minute - KEEP_MIN;
-      for (let s = 0; s < SHARDS; s++) this.sql.exec('DELETE FROM snap WHERE shard = ? AND minute < ?', s, cutoff);
       const now = Date.now();
       this.sql.exec('DELETE FROM atc_pending WHERE expires < ?', now);
       this.sql.exec('DELETE FROM atc_session WHERE created < ?', now - 24 * 3600e3);
       this.sql.exec('DELETE FROM clearance WHERE at < ?', now - 6 * 3600e3);
-      this.sql.exec('DELETE FROM active WHERE takeoff < ?', now - 24 * 3600e3);
-      this.sql.exec('DELETE FROM atc_snap WHERE minute < ?', cutoff);
+      this.sql.exec('DELETE FROM atc_snap WHERE minute < ?', minute - ATC_KEEP_MIN);
       if (minute % 120 === 0) {
         this.sql.exec('DELETE FROM sess WHERE seen < ?', (minute - KEEP_MIN - 24 * 60) * 60000);
         this.known = null;
@@ -165,10 +160,12 @@ export class Recorder extends DurableObject {
       if (minute % 1440 === 0) {
         this.sql.exec('DELETE FROM touchdown WHERE at < ?', now - 48 * 3600e3);
         this.sql.exec('DELETE FROM weekly WHERE week < ?', weekOf(now) - 12);
-        this.sql.exec('DELETE FROM atc_week WHERE week < ?', weekOf(now) - 12);
+        this.cleanupOld(minute);
       }
     }
-    this.setMeta({ lastMinute: String(minute), pilots: String(n) });
+    // Status lives in memory; written to storage only every 10 minutes (saves ~2.8k writes a day).
+    this.last = { minute, pilots: n };
+    if (minute % 10 === 0) this.setMeta({ lastMinute: String(minute), pilots: String(n) });
     return { ok: true, pilots: n };
   }
 
@@ -189,10 +186,10 @@ export class Recorder extends DurableObject {
     if (!this.prev) {
       // First run after a restart: rebuild the previous minute from the last snapshot.
       this.prev = new Map();
-      const rows = [];
-      for (let sh = 0; sh < SHARDS; sh++) rows.push(...this.sql.exec('SELECT data FROM snap WHERE shard = ? AND minute = ?', sh, minute - 1).toArray());
-      for (const r of rows) {
-        const dv = new DataView(r.data instanceof ArrayBuffer ? r.data : new Uint8Array(r.data).buffer);
+      for (let sh = 0; sh < SHARDS; sh++) {
+        const u8 = this.frame(sh, minute - 1);
+        if (!u8) continue;
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
         for (let i = 0; i + REC <= dv.byteLength; i += REC) this.prev.set(dv.getUint32(i), dv.getUint8(i + 16) === 1);
       }
     }
@@ -201,27 +198,39 @@ export class Recorder extends DurableObject {
       const was = this.prev.get(p.id), is = cur.get(p.id);
       const fp = p.flightPlan || {};
       if (was && !is) {
-        const info = { callsign: p.callsign, dep: fp.departureId || null, arr: fp.arrivalId || null, aircraft: (fp.aircraft && fp.aircraft.icaoCode) || fp.aircraftId || null, online: p.createdAt || null };
-        this.sql.exec('INSERT OR REPLACE INTO active (session, vid, data, takeoff) VALUES (?, ?, ?, ?)', p.id, p.userId, JSON.stringify(info), now);
+        this.takeoffs.set(p.id, minute); // memory only: no write at takeoff
       } else if (!was && is) {
-        const a = this.sql.exec('SELECT vid, data, takeoff FROM active WHERE session = ?', p.id).toArray()[0];
-        if (a) {
-          this.sql.exec('DELETE FROM active WHERE session = ?', p.id);
-          const info = JSON.parse(a.data);
-          const flight = now - a.takeoff >= 3 * 60000 ? this.summarise(p, info, a.takeoff, now) : null; // ignore bounces
-          if (flight) {
-            this.sql.exec('INSERT OR REPLACE INTO logbook (vid, landed, data) VALUES (?, ?, ?)', a.vid, now, JSON.stringify(flight));
-            const best = flight.touchdown ? Math.abs(flight.touchdown.fpm) : null;
-            this.sql.exec(
-              'INSERT INTO weekly (week, vid, minutes, flights, best_fpm, callsign) VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT (week, vid) DO UPDATE SET minutes = minutes + excluded.minutes, flights = flights + 1, callsign = excluded.callsign, best_fpm = CASE WHEN excluded.best_fpm IS NULL THEN best_fpm WHEN best_fpm IS NULL THEN excluded.best_fpm ELSE MIN(best_fpm, excluded.best_fpm) END',
-              weekOf(now), a.vid, flight.airborneMin, best, flight.callsign,
-            );
-            this.lbCache = null;
-          }
-        }
+        let to = this.takeoffs.get(p.id);
+        this.takeoffs.delete(p.id);
+        if (to == null) to = this.findTakeoff(p.id, minute); // lost on a restart: look it up in the track
+        if (to == null) continue;
+        const takeoff = to * 60000;
+        if (now - takeoff < 3 * 60000) continue; // a bounce, not a flight
+        const info = { callsign: p.callsign, dep: fp.departureId || null, arr: fp.arrivalId || null, aircraft: (fp.aircraft && fp.aircraft.icaoCode) || fp.aircraftId || null, online: p.createdAt || null };
+        const flight = this.summarise(p, info, takeoff, now);
+        if (!flight) continue;
+        this.sql.exec('INSERT OR REPLACE INTO logbook (vid, landed, data) VALUES (?, ?, ?)', p.userId, now, JSON.stringify(flight));
+        const best = flight.touchdown ? Math.abs(flight.touchdown.fpm) : null;
+        this.sql.exec(
+          'INSERT INTO weekly (week, vid, minutes, flights, best_fpm, callsign) VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT (week, vid) DO UPDATE SET minutes = minutes + excluded.minutes, flights = flights + 1, callsign = excluded.callsign, best_fpm = CASE WHEN excluded.best_fpm IS NULL THEN best_fpm WHEN best_fpm IS NULL THEN excluded.best_fpm ELSE MIN(best_fpm, excluded.best_fpm) END',
+          weekOf(now), p.userId, flight.airborneMin, best, flight.callsign,
+        );
+        this.lbCache = null;
       }
     }
+    for (const id of this.takeoffs.keys()) if (!cur.has(id)) this.takeoffs.delete(id);
     this.prev = cur;
+  }
+
+  /** Last ground → air change in this session's track before `minute` (minute number), or null. */
+  findTakeoff(sessionId, minute) {
+    const pts = this.track(sessionId, 0);
+    for (let i = pts.length - 1; i > 0; i--) {
+      const t = new Date(pts[i].timestamp).getTime() / 60000;
+      if (t >= minute) continue;
+      if (!pts[i].onGround && pts[i - 1].onGround) return t;
+    }
+    return null;
   }
 
   summarise(p, info, takeoff, landed) {
@@ -253,9 +262,15 @@ export class Recorder extends DurableObject {
 
   logbookFor(vid) {
     const rows = this.sql.exec('SELECT landed, data FROM logbook WHERE vid = ? ORDER BY landed DESC LIMIT 300', vid).toArray();
-    const active = this.sql.exec('SELECT session, data, takeoff FROM active WHERE vid = ?', vid).toArray().map((r) => ({ session: r.session, takeoff: r.takeoff, ...JSON.parse(r.data) }));
-    const atc = this.sql.exec('SELECT SUM(minutes) AS m FROM atc_week WHERE vid = ?', vid).toArray()[0];
-    return { flights: rows.map((r) => JSON.parse(r.data)), active, atcMinutes: (atc && atc.m) || 0 };
+    // Flying right now: straight from the live feed (nothing stored at takeoff).
+    const active = ((this.feed && this.feed.clients && this.feed.clients.pilots) || [])
+      .filter((p) => p.userId === vid && p.lastTrack && !p.lastTrack.onGround)
+      .map((p) => {
+        const fp = p.flightPlan || {};
+        const to = this.takeoffs.get(p.id);
+        return { session: p.id, callsign: p.callsign, dep: fp.departureId || null, arr: fp.arrivalId || null, aircraft: (fp.aircraft && fp.aircraft.icaoCode) || fp.aircraftId || null, takeoff: to != null ? to * 60000 : null };
+      });
+    return { flights: rows.map((r) => JSON.parse(r.data)), active, atcMinutes: this.atcMinutes().total.get(vid) || 0 };
   }
 
   /** Touchdown from the Pulse Link add-on. Accepted only if that VID is flying on IVAO right there. */
@@ -283,7 +298,7 @@ export class Recorder extends DurableObject {
       bounces: num(body.bounces, 0, 20) != null ? Math.round(body.bounces) : 0,
       sim: clean(body.sim, 24),
       // Local testing runs on fake minutes; keep the touchdown on the same clock.
-      at: this.env && this.env.TEST_FAKE_MINUTES ? Number(this.getMeta('lastMinute')) * 60000 + 30e3 : now,
+      at: this.env && this.env.TEST_FAKE_MINUTES ? ((this.last && this.last.minute) || 0) * 60000 + 30e3 : now,
     };
     this.sql.exec('INSERT OR REPLACE INTO touchdown (session, at, vid, data) VALUES (?, ?, ?, ?)', p.id, data.at, vid, JSON.stringify(data));
     this.tdLog.set(vid, now);
@@ -298,10 +313,12 @@ export class Recorder extends DurableObject {
     const out = { minutes: [], frames: [], info: {}, atc: [] };
     const ids = new Set();
     for (let m = from; m < from + n; m++) {
-      const parts = [];
-      for (let sh = 0; sh < SHARDS; sh++) parts.push(...this.sql.exec('SELECT data FROM snap WHERE shard = ? AND minute = ?', sh, m).toArray()); // 16 key lookups
-      if (!parts.length) continue;
-      const bufs = parts.map((r) => new Uint8Array(r.data instanceof ArrayBuffer ? r.data : r.data.buffer || r.data));
+      const bufs = [];
+      for (let sh = 0; sh < SHARDS; sh++) {
+        const u8 = this.frame(sh, m);
+        if (u8) bufs.push(u8);
+      }
+      if (!bufs.length) continue;
       const len = bufs.reduce((a, b) => a + b.length, 0);
       const all = new Uint8Array(len);
       let o = 0;
@@ -320,9 +337,17 @@ export class Recorder extends DurableObject {
     }
     const a = this.sql.exec('SELECT minute, data FROM atc_snap WHERE minute <= ? ORDER BY minute DESC LIMIT 1', from + Math.floor(n / 2)).toArray()[0];
     if (a) out.atc = JSON.parse(a.data);
-    const first = this.sql.exec('SELECT minute FROM snap WHERE shard = 0 ORDER BY minute LIMIT 1').toArray()[0];
-    out.oldest = first ? first.minute : null;
-    out.latest = Number(this.getMeta('lastMinute')) || null;
+    const mins = [...this.shardMap(0).keys()];
+    out.oldest = mins.length ? Math.min(...mins) : null;
+    if (!this.noOldSnap) {
+      try {
+        const o = this.sql.exec('SELECT MIN(minute) AS m FROM snap WHERE shard = 0 AND minute >= ?', Math.floor(Date.now() / 60000) - KEEP_MIN).toArray()[0];
+        if (o && o.m && (out.oldest == null || o.m < out.oldest)) out.oldest = o.m;
+      } catch {
+        this.noOldSnap = true;
+      }
+    }
+    out.latest = this.latestMinute();
     return out;
   }
 
@@ -338,7 +363,7 @@ export class Recorder extends DurableObject {
       hours: rows('SELECT vid, callsign, minutes, flights FROM weekly WHERE week = ? ORDER BY minutes DESC LIMIT 10'),
       flights: rows('SELECT vid, callsign, minutes, flights FROM weekly WHERE week = ? ORDER BY flights DESC, minutes DESC LIMIT 10'),
       landings: rows('SELECT vid, callsign, best_fpm AS fpm FROM weekly WHERE week = ? AND best_fpm IS NOT NULL ORDER BY best_fpm ASC LIMIT 10'),
-      atc: rows('SELECT vid, callsign, minutes FROM atc_week WHERE week = ? ORDER BY minutes DESC LIMIT 10'),
+      atc: [...(this.atcMinutes().weeks.get(week) || new Map()).entries()].map(([vid, v]) => ({ vid, callsign: v.callsign, minutes: v.minutes })).sort((a, b) => b.minutes - a.minutes).slice(0, 10),
     };
     this.lbCache = { key, at: Date.now(), body };
     return body;
@@ -353,10 +378,101 @@ export class Recorder extends DurableObject {
   }
 
   status() {
-    const out = {};
+    const out = { storage: 'ring' };
     for (const r of this.sql.exec('SELECT k, v FROM meta').toArray()) out[r.k] = r.v;
-    if (out.lastMinute) out.lastRecorded = new Date(Number(out.lastMinute) * 60000).toISOString();
+    const latest = this.latestMinute();
+    if (latest) out.lastMinute = String(latest);
+    if (this.last) out.pilots = String(this.last.pilots);
+    if (latest) out.lastRecorded = new Date(latest * 60000).toISOString();
     return out;
+  }
+
+  latestMinute() {
+    if (this.last) return this.last.minute;
+    const r = this.sql.exec('SELECT MAX(minute) AS m FROM ring WHERE shard = 0').toArray()[0];
+    return (r && r.m) || Number(this.getMeta('lastMinute')) || null;
+  }
+
+  // ───────── position storage (ring + memory)
+
+  writeShard(shard, minute, buf) {
+    this.sql.exec('INSERT INTO ring (shard, slot, minute, data) VALUES (?, ?, ?, ?) ON CONFLICT (shard, slot) DO UPDATE SET minute = excluded.minute, data = excluded.data', shard, minute % SLOTS, minute, buf);
+    const m = this.mem.get(shard);
+    if (m) {
+      m.set(minute, new Uint8Array(buf));
+      m.delete(minute - SLOTS);
+      for (const k of m.keys()) if (k <= minute - SLOTS) m.delete(k);
+    }
+  }
+
+  /** All recent minutes of one shard, read from storage once and then kept in memory. */
+  shardMap(shard) {
+    let m = this.mem.get(shard);
+    if (m) return m;
+    m = new Map();
+    for (const r of this.sql.exec('SELECT minute, data FROM ring WHERE shard = ?', shard).toArray()) m.set(r.minute, toU8(r.data));
+    this.mem.set(shard, m);
+    return m;
+  }
+
+  /** One shard at one minute (memory if loaded, else a single key lookup). */
+  frame(shard, minute) {
+    const m = this.mem.get(shard);
+    let u8 = null;
+    if (m) u8 = m.get(minute) || null;
+    else {
+      const r = this.sql.exec('SELECT minute, data FROM ring WHERE shard = ? AND slot = ?', shard, minute % SLOTS).toArray()[0];
+      if (r && r.minute === minute) u8 = toU8(r.data);
+    }
+    if (u8 || this.noOldSnap) return u8;
+    // Switching from the old storage: minutes from before the ring existed.
+    try {
+      const o = this.sql.exec('SELECT data FROM snap WHERE shard = ? AND minute = ?', shard, minute).toArray()[0];
+      return o ? toU8(o.data) : null;
+    } catch {
+      this.noOldSnap = true;
+      return null;
+    }
+  }
+
+  /** ATC minutes from the 5-minute snapshots: total per VID (8 days) and per week. Cached 10 min. */
+  atcMinutes() {
+    if (this.atcAgg && Date.now() - this.atcAgg.at < 600e3) return this.atcAgg;
+    const total = new Map();
+    const weeks = new Map();
+    const since = Math.floor(Date.now() / 60000) - ATC_KEEP_MIN;
+    for (const r of this.sql.exec('SELECT minute, data FROM atc_snap WHERE minute >= ?', since).toArray()) {
+      const week = weekOf(r.minute * 60000);
+      let w = weeks.get(week);
+      if (!w) weeks.set(week, (w = new Map()));
+      for (const a of JSON.parse(r.data)) {
+        const vid = a[5];
+        if (!vid || !POSITIONS.has(a[1])) continue;
+        total.set(vid, (total.get(vid) || 0) + 5);
+        const cur = w.get(vid) || { callsign: a[0], minutes: 0 };
+        cur.minutes += 5;
+        cur.callsign = a[0];
+        w.set(vid, cur);
+      }
+    }
+    this.atcAgg = { at: Date.now(), total, weeks };
+    return this.atcAgg;
+  }
+
+  /** Old tables from earlier versions: dropped once their data is past the retention window. */
+  cleanupOld(minute) {
+    try {
+      const r = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('snap', 'active', 'atc_week')").toArray();
+      for (const t of r) {
+        if (t.name === 'snap') {
+          const mx = this.sql.exec('SELECT MAX(minute) AS m FROM snap WHERE shard = 0').toArray()[0];
+          if (mx && mx.m && mx.m > minute - KEEP_MIN) continue; // still has useful history
+        }
+        this.sql.exec(`DROP TABLE ${t.name}`);
+      }
+    } catch (e) {
+      this.setMeta({ cleanupError: String(e && e.message ? e.message : e) });
+    }
   }
 
   /** Positions of one IVAO session, oldest first, in the same shape as IVAO's tracks endpoint. */
@@ -364,10 +480,22 @@ export class Recorder extends DurableObject {
     const id = sessionId >>> 0;
     const now = Math.floor(Date.now() / 60000);
     const from = Math.max(now - KEEP_MIN, sinceMs ? Math.floor(sinceMs / 60000) + 1 : 0);
-    const rows = this.sql.exec('SELECT minute, data FROM snap WHERE shard = ? AND minute >= ? ORDER BY minute', id % SHARDS, from).toArray();
+    const shard = id % SHARDS;
+    const m = this.shardMap(shard);
+    const rows = [...m.keys()].filter((k) => k >= from).sort((a, b) => a - b).map((k) => ({ minute: k, data: m.get(k) }));
+    // Switching from the old storage: history from before the ring existed is still in `snap`.
+    const oldest = rows.length ? rows[0].minute : Infinity;
+    if (oldest > from && !this.noOldSnap) {
+      try {
+        const old = this.sql.exec('SELECT minute, data FROM snap WHERE shard = ? AND minute >= ? AND minute < ? ORDER BY minute', shard, from, oldest).toArray();
+        rows.unshift(...old.map((r) => ({ minute: r.minute, data: toU8(r.data) })));
+      } catch {
+        this.noOldSnap = true; // table gone
+      }
+    }
     const pts = [];
     for (const r of rows) {
-      const dv = new DataView(r.data instanceof ArrayBuffer ? r.data : new Uint8Array(r.data).buffer);
+      const dv = new DataView(r.data.buffer, r.data.byteOffset, r.data.byteLength);
       const count = Math.floor(dv.byteLength / REC);
       for (let i = 0; i < count; i++) {
         const o = i * REC;
@@ -536,6 +664,10 @@ Object.assign(Recorder.prototype, {
 });
 
 const recorder = (env) => env.REC.get(env.REC.idFromName('main'));
+function toU8(d) {
+  return d instanceof Uint8Array ? d : d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer || d);
+}
+
 function b64(u8) {
   let s = '';
   for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
@@ -604,7 +736,7 @@ export default {
       const hit = await cache.match(key);
       if (hit) return hit;
       const body = await rec.replay(from, n);
-      const complete = from + n <= (body.latest || 0);
+      const complete = from + n <= (body.latest || 0) && body.frames.length > 0; // never cache an empty window
       const res = json(body, 200, { 'Cache-Control': complete ? 'public, max-age=3600' : 'no-store' });
       if (complete) ctx.waitUntil(cache.put(key, res.clone()));
       return res;
